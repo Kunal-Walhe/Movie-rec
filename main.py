@@ -15,14 +15,12 @@ from dotenv import load_dotenv
 # ENV
 # =========================
 load_dotenv()
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+OMDB_API_KEY = os.getenv("OMDB_API_KEY", "b0bdba77")
 
-TMDB_BASE = "https://api.themoviedb.org/3"
-TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
+OMDB_BASE = "http://www.omdbapi.com/"
 
-if not TMDB_API_KEY:
-    # Don't crash import-time in production if you prefer; but for you better fail early:
-    raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
+if not OMDB_API_KEY:
+    raise RuntimeError("OMDB_API_KEY missing. Put it in .env as OMDB_API_KEY=xxxx")
 
 
 # =========================
@@ -60,16 +58,16 @@ TITLE_TO_IDX: Optional[Dict[str, int]] = None
 # =========================
 # MODELS
 # =========================
-class TMDBMovieCard(BaseModel):
-    tmdb_id: int
+class OMDBMovieCard(BaseModel):
+    imdb_id: str
     title: str
     poster_url: Optional[str] = None
     release_date: Optional[str] = None
     vote_average: Optional[float] = None
 
 
-class TMDBMovieDetails(BaseModel):
-    tmdb_id: int
+class OMDBMovieDetails(BaseModel):
+    imdb_id: str
     title: str
     overview: Optional[str] = None
     release_date: Optional[str] = None
@@ -81,14 +79,14 @@ class TMDBMovieDetails(BaseModel):
 class TFIDFRecItem(BaseModel):
     title: str
     score: float
-    tmdb: Optional[TMDBMovieCard] = None
+    omdb: Optional[OMDBMovieCard] = None
 
 
 class SearchBundleResponse(BaseModel):
     query: str
-    movie_details: TMDBMovieDetails
+    movie_details: OMDBMovieDetails
     tfidf_recommendations: List[TFIDFRecItem]
-    genre_recommendations: List[TMDBMovieCard]
+    genre_recommendations: List[OMDBMovieCard]
 
 
 # =========================
@@ -99,86 +97,83 @@ def _norm_title(t: str) -> str:
 
 
 def make_img_url(path: Optional[str]) -> Optional[str]:
-    if not path:
+    # OMDB returns full URLs like "https://m.media-amazon.com/images/..."
+    if not path or path == "N/A":
         return None
-    return f"{TMDB_IMG_500}{path}"
+    return path
 
 
-async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+async def omdb_get(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Safe TMDB GET:
+    Safe OMDB GET:
     - Network errors -> 502
-    - TMDB API errors -> 502 with detail
     """
     q = dict(params)
-    q["api_key"] = TMDB_API_KEY
+    q["apikey"] = OMDB_API_KEY
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(f"{TMDB_BASE}{path}", params=q)
+            r = await client.get(OMDB_BASE, params=q)
     except httpx.RequestError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"TMDB request error: {type(e).__name__} | {repr(e)}",
+            detail=f"OMDB request error: {type(e).__name__} | {repr(e)}",
         )
 
     if r.status_code != 200:
         raise HTTPException(
-            status_code=502, detail=f"TMDB error {r.status_code}: {r.text}"
+            status_code=502, detail=f"OMDB error {r.status_code}: {r.text}"
         )
 
     return r.json()
 
 
-async def tmdb_cards_from_results(
+async def omdb_cards_from_results(
     results: List[dict], limit: int = 20
-) -> List[TMDBMovieCard]:
-    out: List[TMDBMovieCard] = []
+) -> List[OMDBMovieCard]:
+    out: List[OMDBMovieCard] = []
     for m in (results or [])[:limit]:
         out.append(
-            TMDBMovieCard(
-                tmdb_id=int(m["id"]),
-                title=m.get("title") or m.get("name") or "",
-                poster_url=make_img_url(m.get("poster_path")),
-                release_date=m.get("release_date"),
-                vote_average=m.get("vote_average"),
+            OMDBMovieCard(
+                imdb_id=m.get("imdbID", ""),
+                title=m.get("Title", "Untitled"),
+                poster_url=make_img_url(m.get("Poster")),
+                release_date=m.get("Year"),
+                vote_average=None, # OMDB search doesn't return ratings easily
             )
         )
     return out
 
 
-async def tmdb_movie_details(movie_id: int) -> TMDBMovieDetails:
-    data = await tmdb_get(f"/movie/{movie_id}", {"language": "en-US"})
-    return TMDBMovieDetails(
-        tmdb_id=int(data["id"]),
-        title=data.get("title") or "",
-        overview=data.get("overview"),
-        release_date=data.get("release_date"),
-        poster_url=make_img_url(data.get("poster_path")),
-        backdrop_url=make_img_url(data.get("backdrop_path")),
-        genres=data.get("genres", []) or [],
+async def omdb_movie_details(imdb_id: str) -> OMDBMovieDetails:
+    data = await omdb_get({"i": imdb_id, "plot": "short"})
+    
+    if data.get("Response") == "False":
+        raise HTTPException(status_code=404, detail=data.get("Error", "Movie not found"))
+
+    genres = [{"id": 0, "name": g.strip()} for g in data.get("Genre", "").split(",") if g.strip()]
+    
+    return OMDBMovieDetails(
+        imdb_id=data.get("imdbID", ""),
+        title=data.get("Title", ""),
+        overview=data.get("Plot", ""),
+        release_date=data.get("Released", ""),
+        poster_url=make_img_url(data.get("Poster")),
+        backdrop_url=None, # OMDB doesn't usually provide standard backdrops
+        genres=genres,
     )
 
 
-async def tmdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
+async def omdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
     """
-    Raw TMDB response for keyword search (MULTIPLE results).
-    Streamlit will use this for suggestions and grid.
+    Raw OMDB response for keyword search (MULTIPLE results).
     """
-    return await tmdb_get(
-        "/search/movie",
-        {
-            "query": query,
-            "include_adult": "false",
-            "language": "en-US",
-            "page": page,
-        },
-    )
+    return await omdb_get({"s": query, "page": page, "type": "movie"})
 
 
-async def tmdb_search_first(query: str) -> Optional[dict]:
-    data = await tmdb_search_movies(query=query, page=1)
-    results = data.get("results", [])
+async def omdb_search_first(query: str) -> Optional[dict]:
+    data = await omdb_search_movies(query=query, page=1)
+    results = data.get("Search", [])
     return results[0] if results else None
 
 
@@ -257,21 +252,20 @@ def tfidf_recommend_titles(
     return out
 
 
-async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
+async def attach_omdb_card_by_title(title: str) -> Optional[OMDBMovieCard]:
     """
-    Uses TMDB search by title to fetch poster for a local title.
+    Uses OMDB search by title to fetch poster for a local title.
     If not found, returns None (never crashes the endpoint).
     """
     try:
-        m = await tmdb_search_first(title)
+        m = await omdb_search_first(title)
         if not m:
             return None
-        return TMDBMovieCard(
-            tmdb_id=int(m["id"]),
-            title=m.get("title") or title,
-            poster_url=make_img_url(m.get("poster_path")),
-            release_date=m.get("release_date"),
-            vote_average=m.get("vote_average"),
+        return OMDBMovieCard(
+            imdb_id=m.get("imdbID", ""),
+            title=m.get("Title", title),
+            poster_url=make_img_url(m.get("Poster")),
+            release_date=m.get("Year"),
         )
     except Exception:
         return None
@@ -316,84 +310,71 @@ def health():
     return {"status": "ok"}
 
 
-# ---------- HOME FEED (TMDB) ----------
-@app.get("/home", response_model=List[TMDBMovieCard])
+# ---------- HOME FEED (OMDB Fallback) ----------
+@app.get("/home", response_model=List[OMDBMovieCard])
 async def home(
     category: str = Query("popular"),
     limit: int = Query(24, ge=1, le=50),
 ):
     """
     Home feed for Streamlit (posters).
-    category:
-      - trending (trending/movie/day)
-      - popular, top_rated, upcoming, now_playing  (movie/{category})
+    Since OMDB doesn't have a discover/popular endpoint like TMDB,
+    we'll fetch a preset list of popular movies to simulate the feed.
     """
-    try:
-        if category == "trending":
-            data = await tmdb_get("/trending/movie/day", {"language": "en-US"})
-            return await tmdb_cards_from_results(data.get("results", []), limit=limit)
-
-        if category not in {"popular", "top_rated", "upcoming", "now_playing"}:
-            raise HTTPException(status_code=400, detail="Invalid category")
-
-        data = await tmdb_get(f"/movie/{category}", {"language": "en-US", "page": 1})
-        return await tmdb_cards_from_results(data.get("results", []), limit=limit)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Home route failed: {e}")
+    popular_keywords = ["Batman", "Avengers", "Star Wars", "Matrix", "Spider-Man", "Harry Potter"]
+    
+    results = []
+    # Fetch partial pages for a mix of movies
+    for kw in popular_keywords:
+        try:
+            data = await omdb_get({"s": kw, "page": 1, "type": "movie"})
+            search_items = data.get("Search", [])
+            results.extend(search_items[:4])  # take top 4 from each
+        except Exception:
+            continue
+            
+    return await omdb_cards_from_results(results, limit=limit)
 
 
-# ---------- TMDB KEYWORD SEARCH (MULTIPLE RESULTS) ----------
+# ---------- OMDB KEYWORD SEARCH (MULTIPLE RESULTS) ----------
 @app.get("/tmdb/search")
-async def tmdb_search(
+async def omdb_search_route(
     query: str = Query(..., min_length=1),
     page: int = Query(1, ge=1, le=10),
 ):
     """
-    Returns RAW TMDB shape with 'results' list.
-    Streamlit will use it for:
-      - dropdown suggestions
-      - grid results
+    Returns RAW OMDB shape with 'Search' list.
+    Streamlit will use it for dropdown suggestions.
     """
-    return await tmdb_search_movies(query=query, page=page)
+    return await omdb_search_movies(query=query, page=page)
 
 
 # ---------- MOVIE DETAILS (SAFE ROUTE) ----------
-@app.get("/movie/id/{tmdb_id}", response_model=TMDBMovieDetails)
-async def movie_details_route(tmdb_id: int):
-    return await tmdb_movie_details(tmdb_id)
+@app.get("/movie/id/{imdb_id}", response_model=OMDBMovieDetails)
+async def movie_details_route(imdb_id: str):
+    return await omdb_movie_details(imdb_id)
 
 
 # ---------- GENRE RECOMMENDATIONS ----------
-@app.get("/recommend/genre", response_model=List[TMDBMovieCard])
+@app.get("/recommend/genre", response_model=List[OMDBMovieCard])
 async def recommend_genre(
-    tmdb_id: int = Query(...),
+    imdb_id: str = Query(...),
     limit: int = Query(18, ge=1, le=50),
 ):
     """
-    Given a TMDB movie ID:
-    - fetch details
-    - pick first genre
-    - discover movies in that genre (popular)
+    Given an OMDB movie ID:
+    - OMDB does not support discovering by genre directly via API easily.
+    - We will simulate this by returning similar movies for the first genre if available.
     """
-    details = await tmdb_movie_details(tmdb_id)
+    details = await omdb_movie_details(imdb_id)
     if not details.genres:
         return []
 
-    genre_id = details.genres[0]["id"]
-    discover = await tmdb_get(
-        "/discover/movie",
-        {
-            "with_genres": genre_id,
-            "language": "en-US",
-            "sort_by": "popularity.desc",
-            "page": 1,
-        },
-    )
-    cards = await tmdb_cards_from_results(discover.get("results", []), limit=limit)
-    return [c for c in cards if c.tmdb_id != tmdb_id]
+    # Fallback to search using the genre as a keyword
+    genre_name = details.genres[0]["name"]
+    discover = await omdb_get({"s": genre_name, "type": "movie", "page": 1})
+    cards = await omdb_cards_from_results(discover.get("Search", []), limit=limit)
+    return [c for c in cards if c.imdb_id != imdb_id]
 
 
 # ---------- TF-IDF ONLY (debug/useful) ----------
@@ -414,30 +395,23 @@ async def search_bundle(
     genre_limit: int = Query(12, ge=1, le=30),
 ):
     """
-    This endpoint is for when you have a selected movie and want:
-      - movie details
-      - TF-IDF recommendations (local) + posters
-      - Genre recommendations (TMDB) + posters
-
-    NOTE:
-    - It selects the BEST match from TMDB for the given query.
-    - If you want MULTIPLE matches, use /tmdb/search
+    This endpoint is for when you have a selected movie and want recommendations.
     """
-    best = await tmdb_search_first(query)
+    best = await omdb_search_first(query)
     if not best:
         raise HTTPException(
-            status_code=404, detail=f"No TMDB movie found for query: {query}"
+            status_code=404, detail=f"No OMDB movie found for query: {query}"
         )
 
-    tmdb_id = int(best["id"])
-    details = await tmdb_movie_details(tmdb_id)
+    imdb_id = best.get("imdbID")
+    details = await omdb_movie_details(imdb_id)
 
     # 1) TF-IDF recommendations (never crash endpoint)
     tfidf_items: List[TFIDFRecItem] = []
 
     recs: List[Tuple[str, float]] = []
     try:
-        # try local dataset by TMDB title
+        # try local dataset by title
         recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
     except Exception:
         # fallback to user query
@@ -447,26 +421,19 @@ async def search_bundle(
             recs = []
 
     for title, score in recs:
-        card = await attach_tmdb_card_by_title(title)
-        tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
+        card = await attach_omdb_card_by_title(title)
+        tfidf_items.append(TFIDFRecItem(title=title, score=score, omdb=card))
 
-    # 2) Genre recommendations (TMDB discover by first genre)
-    genre_recs: List[TMDBMovieCard] = []
+    # 2) Genre recommendations (OMDB by keyword)
+    genre_recs: List[OMDBMovieCard] = []
     if details.genres:
-        genre_id = details.genres[0]["id"]
-        discover = await tmdb_get(
-            "/discover/movie",
-            {
-                "with_genres": genre_id,
-                "language": "en-US",
-                "sort_by": "popularity.desc",
-                "page": 1,
-            },
-        )
-        cards = await tmdb_cards_from_results(
-            discover.get("results", []), limit=genre_limit
-        )
-        genre_recs = [c for c in cards if c.tmdb_id != details.tmdb_id]
+        genre_name = details.genres[0]["name"]
+        try:
+            discover = await omdb_get({"s": genre_name, "type": "movie", "page": 1})
+            cards = await omdb_cards_from_results(discover.get("Search", []), limit=genre_limit)
+            genre_recs = [c for c in cards if c.imdb_id != details.imdb_id]
+        except Exception:
+            genre_recs = []
 
     return SearchBundleResponse(
         query=query,
